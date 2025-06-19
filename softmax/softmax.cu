@@ -2,60 +2,70 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-
-
-/**
- * @brief Computes the softmax over the last dimension for each batch
- * 
- * @param input Pointer to input tensor data of shape (batch_size, dim)
- * @param output    Pointer to output tensor data (same shape as input)
- * @param batch_size Number of rows (batches)
- * @param dim   Size of the softmax dimension
- * 
- * Each thread computes the softmax for one batch element.
-*/
 __global__
-void softmax_kernel(const float* input, float* output, int batch_size, int dim)
-{
-    int batch_idx = threadIdx.x;
+void softmax_kernel(const float* input, float* output, int batch_size, int dim) {
+    extern __shared__ float shared_data[];
 
-    if (batch_idx < batch_size)
-    {
-        float sum_exp = 0.0f;
-        for (int i = 0; i < dim; i++)
-        {
-            float val = __expf(input[batch_idx * dim + i]);
-            output[batch_idx * dim + i] = val;
-            sum_exp += val;
-        }
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
 
-        for (int i = 0; i < dim; i++)
-        {
-            output[batch_idx * dim + i] /= sum_exp;
-        }
+    const float* input_row = input + batch_idx * dim;
+    float* output_row = output + batch_idx * dim;
+
+    // Step 1: find max for numerical stability
+    float max_val = -FLT_MAX;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        max_val = fmaxf(max_val, input_row[i]);
+    }
+    // Reduction to get global max
+    shared_data[tid] = max_val;
+    __syncthreads();
+
+    // Parallel reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            shared_data[tid] = fmaxf(shared_data[tid], shared_data[tid + stride]);
+        __syncthreads();
+    }
+    float row_max = shared_data[0];
+
+    // Step 2: compute exponentials and sum
+    float sum = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = expf(input_row[i] - row_max);
+        output_row[i] = val;
+        sum += val;
+    }
+
+    // Reduction to get total sum
+    shared_data[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            shared_data[tid] += shared_data[tid + stride];
+        __syncthreads();
+    }
+    float row_sum = shared_data[0];
+
+    // Step 3: normalize
+    for (int i = tid; i < dim; i += blockDim.x) {
+        output_row[i] /= row_sum;
     }
 }
 
 
-
-
-/**
- * @brief CUDA wrapper function to compute softmax over the last dimension.
- * 
- * @param input A 2D tensor (batch_size, dim)
- * @return      A tensor of the same shape with softmax applied.
-*/
 torch::Tensor softmax(torch::Tensor input)
 {
-
     int batch_size = input.size(0);
     int dim = input.size(1);
+
     torch::Tensor output = torch::empty_like(input);
 
-    dim3 threads(batch_size);
-    dim3 blocks(1);
+    int threads = 256;
+    int shared_mem = threads * sizeof(float);
 
-    softmax_kernel<<<blocks, threads>>>(
+    softmax_kernel<<<batch_size, threads, shared_mem>>>(
         input.data_ptr<float>(),
         output.data_ptr<float>(),
         batch_size,
