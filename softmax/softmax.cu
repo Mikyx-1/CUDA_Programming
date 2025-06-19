@@ -3,6 +3,17 @@
 #include <cuda_runtime.h>
 
 
+
+/**
+ * @brief Computes the softmax over the last dimension for each batch
+ * 
+ * @param input Pointer to input tensor data of shape (batch_size, dim)
+ * @param output    Pointer to output tensor data (same shape as input)
+ * @param batch_size Number of rows (batches)
+ * @param dim   Size of the softmax dimension
+ * 
+ * Each thread computes the softmax for one batch element.
+*/
 __global__
 void softmax_kernel(const float* input, float* output, int batch_size, int dim)
 {
@@ -27,6 +38,13 @@ void softmax_kernel(const float* input, float* output, int batch_size, int dim)
 
 
 
+
+/**
+ * @brief CUDA wrapper function to compute softmax over the last dimension.
+ * 
+ * @param input A 2D tensor (batch_size, dim)
+ * @return      A tensor of the same shape with softmax applied.
+*/
 torch::Tensor softmax(torch::Tensor input)
 {
 
