@@ -13,7 +13,7 @@ void softmax_kernel(const float* input, float* output, int batch_size, int dim) 
     float* output_row = output + batch_idx * dim;
 
     // Step 1: find max for numerical stability
-    float max_val = -FLT_MAX;
+    float max_val = -INFINITY;
     for (int i = tid; i < dim; i += blockDim.x) {
         max_val = fmaxf(max_val, input_row[i]);
     }
@@ -62,7 +62,7 @@ torch::Tensor softmax(torch::Tensor input)
 
     torch::Tensor output = torch::empty_like(input);
 
-    int threads = 256;
+    int threads = 256;      // Must be the power of 2 (2^n)
     int shared_mem = threads * sizeof(float);
 
     softmax_kernel<<<batch_size, threads, shared_mem>>>(
