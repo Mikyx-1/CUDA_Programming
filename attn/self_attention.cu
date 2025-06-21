@@ -96,6 +96,34 @@ void softmax_kernel(const float* input, float* output, int batch_size, int seq_l
 }
 
 
+__global__
+void dot_matrix(const float* a, const float* b, float* c, int batch_size, int a_height, int a_width, int b_height, int b_width)
+{
+    // Ensure a_width == b_height
+    // Dot 2 matrices of size (batch_size, a_height, a_width) (batch_size, b_height, b_width)
+    // Expected output (batch_size, a_height, b_width)
+    
+    int batch_id = blockIdx.z;
+
+    int ay = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_id < batch_size && ay < a_height && bx < b_width)
+    {   
+        float sum = 0.0f;
+        for (int dim_id = 0; dim_id < a_width; dim_id++)
+        {
+            int a_idx = batch_id * a_height * a_width + ay * a_width + dim_id;
+            int b_idx = batch_id * b_height * b_width + dim_id * b_width + bx;
+            sum += a[a_idx] * b[b_idx];
+        }
+        c[batch_id * a_height * b_width + ay * b_width + bx] = sum;
+    }
+
+
+}
+
+
 torch::Tensor self_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 {
 
@@ -108,6 +136,7 @@ torch::Tensor self_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     torch::Tensor qkt = torch::empty({batch_size, seq_len, seq_len}, Q.options());
     torch::Tensor attn_scores = torch::empty_like(qkt);
+    torch::Tensor output = torch::empty_like(V);
 
     // Step 1: Calculate QK^T / scale
     dim3 qkt_threads(16, 16);
@@ -138,6 +167,22 @@ torch::Tensor self_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
         seq_len
     );
 
-    // Step 3: softmax(QK^T / scale)  (Not implemented yet)
-    return attn_scores;
+    // Step 3: softmax(QK^T / scale)V  (Not implemented yet)
+
+    dim3 dot_matrix_threads(16, 16);
+    dim3 dot_matrix_blocks((seq_len + dot_matrix_threads.x - 1) / dot_matrix_threads.x,
+                           (dim_v + dot_matrix_threads.y - 1) / dot_matrix_threads.y,
+                           batch_size);
+
+    dot_matrix<<<dot_matrix_blocks, dot_matrix_threads>>>(
+        attn_scores.data_ptr<float>(),
+        V.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        seq_len,
+        seq_len,
+        dim_v
+    );
+    return output;
 }
