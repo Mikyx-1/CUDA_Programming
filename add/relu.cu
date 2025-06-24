@@ -13,7 +13,7 @@
  * 
 */
 __global__
-void relu_kernel(const float* input, float* output, int N)
+void relu_kernel(const float* __restrict__ input, float* __restrict__ output, int N)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
