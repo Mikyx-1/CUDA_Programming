@@ -2,138 +2,114 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-// Main kernel: computes attention output `O` using Q, K, V (query, key, value) with tiling and stable softmax.
+// CUDA kernel for FlashAttention forward pass
 __global__
-void forward_kernel(const float* Q, const float* K, const float* V, 
-                    const int N, const int d,               // N: sequence length, d: embedding dim
-                    const int Tc, const int Tr,             // Tc: #column tiles, Tr: #row tiles
-                    const int Bc, const int Br,             // Bc: column block size, Br: row block size
-                    const float softmax_scale,              // scaling factor for attention
-                    float* l, float* m, float* O)           // softmax accumulators (l,m) and output (O)
+void forward_kernel(const float* Q, const float* K, const float* V,
+                    const int N, const int d,
+                    const int num_col_tiles, const int num_row_tiles,
+                    const int col_block_size, const int row_block_size,
+                    const float softmax_scale,
+                    float* l, float* m, float* O)
 {
-    int tx = threadIdx.x;      // Thread index within the block (0 .. Bc-1)
-    int bx = blockIdx.x;       // Batch index
-    int by = blockIdx.y;       // Head index
+    const int thread_id = threadIdx.x;
+    const int batch_id  = blockIdx.x;
+    const int head_id   = blockIdx.y;
 
-    // Indexing offset for Q, K, V, and O tensors: [B, H, N, d] flattened
-    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);
-    int lm_offset  = (bx * gridDim.y * N) + (by * N); // for l and m: [B, H, N]
+    const int qkv_offset = (batch_id * gridDim.y * N * d) + (head_id * N * d);
+    const int lm_offset  = (batch_id * gridDim.y * N) + (head_id * N);
 
-    // Shared memory layout:
-    // - Qi: Br x d
-    // - Kj: Bc x d
-    // - Vj: Bc x d
-    // - S : Br x Bc
-    extern __shared__ float sram[];
-    int tile_size = Bc * d;
-    float* Qi = sram;                         // Qi tile: Br rows of Q
-    float* Kj = &sram[tile_size];             // Kj tile: Bc rows of K
-    float* Vj = &sram[2 * tile_size];         // Vj tile: Bc rows of V
-    float* S  = &sram[3 * tile_size];         // S matrix: (Br x Bc)
+    extern __shared__ float shared_mem[];
+    const int tile_mem = col_block_size * d;
+    float* Qi = shared_mem;
+    float* Kj = &shared_mem[tile_mem];
+    float* Vj = &shared_mem[2 * tile_mem];
+    float* S  = &shared_mem[3 * tile_mem]; // Br x Bc matrix
 
-    // Loop over all column tiles (K, V)
-    for (int j = 0; j < Tc; j++) {
+    for (int j = 0; j < num_col_tiles; ++j) {
 
-        // === Load K and V tiles to shared memory ===
-        for (int x = 0; x < d; x++) {
-            Kj[(tx * d) + x] = K[qkv_offset + (j * tile_size) + (tx * d) + x];
-            Vj[(tx * d) + x] = V[qkv_offset + (j * tile_size) + (tx * d) + x];
+        // Load current K and V tiles to shared memory
+        for (int k = 0; k < d; ++k) {
+            Kj[thread_id * d + k] = K[qkv_offset + j * tile_mem + thread_id * d + k];
+            Vj[thread_id * d + k] = V[qkv_offset + j * tile_mem + thread_id * d + k];
         }
-        __syncthreads();  // Make sure all threads finish loading Kj and Vj
+        __syncthreads();
 
-        // Loop over all row tiles (Q)
-        for (int i = 0; i < Tr; i++) {
+        for (int i = 0; i < num_row_tiles; ++i) {
 
-            // === Load Qi tile to shared memory ===
-            for (int x = 0; x < d; x++) {
-                Qi[(tx * d) + x] = Q[qkv_offset + (i * tile_size) + (tx * d) + x];
+            // Load Q tile to shared memory
+            for (int k = 0; k < d; ++k) {
+                Qi[thread_id * d + k] = Q[qkv_offset + i * tile_mem + thread_id * d + k];
             }
 
-            // Load previous softmax stats
-            float prev_m = m[lm_offset + (Br * i) + tx];
-            float prev_l = l[lm_offset + (Br * i) + tx];
+            float prev_m = m[lm_offset + i * row_block_size + thread_id];
+            float prev_l = l[lm_offset + i * row_block_size + thread_id];
 
-            // === Compute raw attention scores: S = Q x K^T ===
+            // Compute raw attention scores S = Q.K^T (scaled)
             float max_val = -INFINITY;
-            for (int y = 0; y < Bc; y++) {
-                float dot = 0;
-                for (int x = 0; x < d; x++) {
-                    dot += Qi[(tx * d) + x] * Kj[(y * d) + x];
+            for (int y = 0; y < col_block_size; ++y) {
+                float dot = 0.0f;
+                for (int k = 0; k < d; ++k) {
+                    dot += Qi[thread_id * d + k] * Kj[y * d + k];
                 }
                 dot *= softmax_scale;
-                S[(Bc * tx) + y] = dot;
-                if (dot > max_val) max_val = dot;
+                S[thread_id * col_block_size + y] = dot;
+                max_val = fmaxf(max_val, dot);
             }
 
-            // === Compute softmax: P = exp(S - max), accumulate new l, m ===
-            float row_l = 0;
-            for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - max_val);
-                row_l += S[(Bc * tx) + y];
+            float row_l = 0.0f;
+            for (int y = 0; y < col_block_size; ++y) {
+                S[thread_id * col_block_size + y] = __expf(S[thread_id * col_block_size + y] - max_val);
+                row_l += S[thread_id * col_block_size + y];
             }
 
-            // Numerically stable softmax accumulation
             float new_m = fmaxf(prev_m, max_val);
             float new_l = __expf(prev_m - new_m) * prev_l + __expf(max_val - new_m) * row_l;
 
-            // === Compute weighted sum of values: O += P @ V ===
-            for (int x = 0; x < d; x++) {
-                float val_sum = 0;
-                for (int y = 0; y < Bc; y++) {
-                    val_sum += S[(Bc * tx) + y] * Vj[(y * d) + x];
+            for (int k = 0; k < d; ++k) {
+                float val_sum = 0.0f;
+                for (int y = 0; y < col_block_size; ++y) {
+                    val_sum += S[thread_id * col_block_size + y] * Vj[y * d + k];
                 }
 
-                // Numerically stable update of O
-                float prev_O = O[qkv_offset + (i * tile_size) + (tx * d) + x];
+                float prev_O = O[qkv_offset + i * tile_mem + thread_id * d + k];
                 float updated_O = (1.0f / new_l) *
                     (__expf(prev_m - new_m) * prev_l * prev_O + __expf(max_val - new_m) * val_sum);
-                O[qkv_offset + (i * tile_size) + (tx * d) + x] = updated_O;
+
+                O[qkv_offset + i * tile_mem + thread_id * d + k] = updated_O;
             }
 
-            // Save new softmax stats to HBM
-            m[lm_offset + (Br * i) + tx] = new_m;
-            l[lm_offset + (Br * i) + tx] = new_l;
+            m[lm_offset + i * row_block_size + thread_id] = new_m;
+            l[lm_offset + i * row_block_size + thread_id] = new_l;
         }
-
-        __syncthreads(); // Avoid reading stale K/V from shared memory
+        __syncthreads();
     }
 }
 
-// Host wrapper: manages memory and launches the CUDA kernel
 torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
-    // Block dimensions: tunable tile sizes
-    const int Bc = 32; const int Br = 32;
+    const int col_block_size = 32;
+    const int row_block_size = 32;
 
-    // Tensor shapes: Q, K, V ∈ [B, H, N, d]
-    const int B  = Q.size(0);
-    const int nh = Q.size(1);
-    const int N  = Q.size(2);
-    const int d  = Q.size(3);
+    const int B = Q.size(0);
+    const int H = Q.size(1);
+    const int N = Q.size(2);
+    const int d = Q.size(3);
 
-    // Tile count (ceil divisions)
-    const int Tc = (N + Bc - 1) / Bc;
-    const int Tr = (N + Br - 1) / Br;
+    const int Tc = (N + col_block_size - 1) / col_block_size;
+    const int Tr = (N + row_block_size - 1) / row_block_size;
+    const float scale = 1.0f / sqrtf((float)d);
 
-    const float softmax_scale = 1.0f / sqrtf((float)d);
-
-    // Allocate output tensor and softmax statistics
     auto O = torch::zeros_like(Q);
-    auto l = torch::zeros({B, nh, N}).to(Q.device());
-    auto m = torch::full({B, nh, N}, -INFINITY).to(Q.device());
+    auto l = torch::zeros({B, H, N}, Q.options());
+    auto m = torch::full({B, H, N}, -INFINITY, Q.options());
 
-    // Compute required shared memory size per block
-    const int sram_size = (3 * Bc * d + Bc * Br) * sizeof(float);
-    int max_sram_size;
-    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-    printf("Max shared memory: %d, requested: %d\n", max_sram_size, sram_size);
+    const int shared_mem_size = (3 * col_block_size * d + col_block_size * row_block_size) * sizeof(float);
 
-    // Launch kernel
-    dim3 grid_dim(B, nh);  // 2D grid: [batch, heads]
-    dim3 block_dim(Bc);    // 1D block: Bc threads per row of Q
+    dim3 grid_dim(B, H);
+    dim3 block_dim(col_block_size);
 
-    forward_kernel<<<grid_dim, block_dim, sram_size>>>(
+    forward_kernel<<<grid_dim, block_dim, shared_mem_size>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
-        N, d, Tc, Tr, Bc, Br, softmax_scale,
+        N, d, Tc, Tr, col_block_size, row_block_size, scale,
         l.data_ptr<float>(), m.data_ptr<float>(), O.data_ptr<float>()
     );
 
