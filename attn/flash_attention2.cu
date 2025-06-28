@@ -32,6 +32,7 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
         {
             Kj[(thread_id * d) + dim_id] = K[qkv_offset + (tile_column_id * tile_size) + (thread_id * d) + dim_id];
             Vj[(thread_id * d) + dim_id] = V[qkv_offset + (tile_column_id * tile_size) + (thread_id * d) + dim_id];
+            // Print here to see loaded values
         }
         __syncthreads();
 
@@ -97,7 +98,7 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
 }
 
 
-torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
+torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 {
 
     const int Bc = 32;
