@@ -82,15 +82,15 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
                 float res = 0.0f;
                 for (int seq_id = 0; seq_id < Bc; seq_id++)
                 {
-                    res += S[(thread_id * Bc) + seq_id] * Vj[(seq_id * Bc) + dim_id];
+                    res += S[(thread_id * Bc) + seq_id] * Vj[(seq_id * d) + dim_id];
                 }
-                O[qkv_offset + (tile_column_id * tile_size) + thread_id * d + dim_id] = (1 / row_l_new) \
-                    * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * tile_column_id) + (thread_id * d) + dim_id]) \
+                O[qkv_offset + (tile_row_id * tile_size) + thread_id * d + dim_id] = (1 / row_l_new) \
+                    * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * tile_row_id) + (thread_id * d) + dim_id]) \
                     + (__expf(row_m - row_m_new) * res));
             }
 
-            m[lm_offset + (Br * tile_column_id) + thread_id] = row_m_new;
-            l[lm_offset + (Br * tile_column_id) + thread_id] = row_l_new;
+            m[lm_offset + (Br * tile_row_id) + thread_id] = row_m_new;
+            l[lm_offset + (Br * tile_row_id) + thread_id] = row_l_new;
         }
         __syncthreads();
     }
