@@ -11,9 +11,9 @@ ext = load(
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-q = torch.randn((2, 2, 4, 16)).to(DEVICE)
+q = torch.randn((2, 2, 32, 16)).to(DEVICE)  # Currently, must be divisible by 32
 k = torch.randn_like(q)
 v = torch.randn_like(q)
 
-res = ext.forward(q, k, v)
+res = ext.flash_attention(q, k, v)
 print(f"res: {res}")
