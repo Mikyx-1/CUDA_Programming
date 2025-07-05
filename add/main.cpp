@@ -1,9 +1,9 @@
 #include <torch/extension.h>
 
-torch::Tensor add(torch::Tensor a, torch::Tensor b);
+torch::Tensor relu(torch::Tensor input, bool in_place);
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("add", torch::wrap_pybind_function(add), "Add 2 tensors");
+    m.def("relu", torch::wrap_pybind_function(relu), "ReLU Activation");
 }
