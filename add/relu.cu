@@ -11,7 +11,17 @@ __forceinline__ __device__ float relu_activation(float x)
 }
 
 /**
- * @brief CUDA kernel to apply ReLU activation element-wise.
+ * @brief Inline device function for ReLU activation on float2
+ */
+__forceinline__ __device__ float2 relu_activation_float2(float2 val)
+{
+    val.x = relu_activation(val.x);
+    val.y = relu_activation(val.y);
+    return val;
+}
+
+/**
+ * @brief CUDA kernel to apply ReLU activation using float2 (2 elements per thread).
  * 
  * @param input Pointer to input tensor
  * @param output Pointer to output tensor
@@ -21,10 +31,19 @@ __global__
 void relu_kernel(const float* __restrict__ input, float* __restrict__ output, int N)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int vecN = N >> 1;  // N / 2 using bit shift
 
-    if (tid < N)
+    // Process 2 elements at a time
+    if (tid < vecN)
     {
-        output[tid] = relu_activation(input[tid]);
+        float2 val = reinterpret_cast<const float2*>(input)[tid];
+        reinterpret_cast<float2*>(output)[tid] = relu_activation_float2(val);
+    }
+
+    // Handle last element if N is odd
+    if (tid == 0 && (N & 1))  // N % 2 != 0 using bit mask
+    {
+        output[N - 1] = relu_activation(input[N - 1]);
     }
 }
 
@@ -40,7 +59,7 @@ torch::Tensor relu(torch::Tensor input, bool in_place)
 {
     int N = input.numel();
     int threads = 256;
-    int blocks = (N + threads - 1) / threads;
+    int blocks = ((N >> 1) + threads - 1) / threads;  // Calculate blocks for float2 processing
 
     if (in_place)
     {
