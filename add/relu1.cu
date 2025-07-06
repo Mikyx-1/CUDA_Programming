@@ -1,77 +1,89 @@
-#include <torch/types.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
 
-/**
- * @brief CUDA kernel to apply ReLU activation using float2 + grid-stride loop.
- * 
- * @param input Pointer to input tensor
- * @param output Pointer to output tensor
- * @param N     Total number of elements
- */
-__global__
-void relu_kernel_vec2(const float* __restrict__ input, float* __restrict__ output, int N)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    int vecN = N >> 1;  // Equivalent to N / 2, but faster
-
-    // Process 2 elements at a time
-    for (int idx = tid; idx < vecN; idx += stride)
-    {
-        float2 val = reinterpret_cast<const float2*>(input)[idx];
-        val.x = fmaxf(0.0f, val.x);
-        val.y = fmaxf(0.0f, val.y);
-        reinterpret_cast<float2*>(output)[idx] = val;
-    }
-
-    // Handle last element if N is odd
-    if (tid == 0 && (N & 1))  // N & 1 is equivalent to N % 2 != 0
-    {
-        output[N - 1] = fmaxf(0.0f, input[N - 1]);
+// Optimized vectorized kernel - process 4 float4s per thread
+__global__ void relu_kernel_vec4(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const int N
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int base_idx = tid * 4; // 4 float4s = 16 floats per thread
+    
+    // Unroll loop for better ILP
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int vec_idx = base_idx + i;
+        if (vec_idx * 4 < N) {
+            float4 v = __ldg(reinterpret_cast<const float4*>(input) + vec_idx);
+            v.x = fmaxf(v.x, 0.0f);
+            v.y = fmaxf(v.y, 0.0f);
+            v.z = fmaxf(v.z, 0.0f);
+            v.w = fmaxf(v.w, 0.0f);
+            *(reinterpret_cast<float4*>(output) + vec_idx) = v;
+        }
     }
 }
 
-/**
- * @brief Applies ReLU activation, optionally in-place.
- * 
- * @param input A tensor of any shape.
- * @param in_place If true, modifies input directly.
- * 
- * @return ReLU-activated tensor (same shape as input).
- */
-torch::Tensor relu(torch::Tensor input, bool in_place)
-{
-    TORCH_CHECK(input.is_cuda(), "Input tensor must be on CUDA device");
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input tensor must be float32");
-
-    int N = input.numel();
-    
-    // Optimize thread/block configuration
-    int threads = 512;
-    int blocks = min((N + 1023) >> 10, 2048);  // Equivalent to (N + threads - 1) / threads, but faster
-    
-    // Ensure minimum blocks for GPU utilization
-    blocks = max(blocks, 32);
-
-    if (in_place)
-    {
-        relu_kernel_vec2<<<blocks, threads>>>(
-            input.data_ptr<float>(),
-            input.data_ptr<float>(),
-            N
-        );
-        return input;
+// Remove separate tail kernel - handle in main kernel
+__global__ void relu_kernel_tail(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int start,
+    int N
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = start + tid;
+    if (i < N) {
+        output[i] = fmaxf(__ldg(input + i), 0.0f);
     }
-    else
-    {
-        torch::Tensor output = torch::empty_like(input);
-        relu_kernel_vec2<<<blocks, threads>>>(
-            input.data_ptr<float>(),
-            output.data_ptr<float>(),
-            N
+}
+
+torch::Tensor relu(torch::Tensor input, bool in_place = false) {
+    TORCH_CHECK(input.is_cuda(), "must be CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "must be contiguous");
+    
+    const int N = input.numel();
+    auto output = in_place ? input : torch::empty_like(input);
+    
+    if (N == 0) return output;
+    
+    const float* in_ptr = input.data_ptr<float>();
+    float* out_ptr = output.data_ptr<float>();
+    
+    // Get device properties
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    
+    // Optimize for memory bandwidth - each thread processes 16 floats
+    const int elements_per_thread = 16; // 4 float4s
+    const int total_vec4s = N / 4;
+    const int vec4s_per_thread = elements_per_thread / 4;
+    const int required_threads = (total_vec4s + vec4s_per_thread - 1) / vec4s_per_thread;
+    
+    // Use high occupancy
+    int threads = 256; // Good for most GPUs
+    int blocks = min(65535, (required_threads + threads - 1) / threads);
+    
+    // Ensure we have enough blocks to saturate GPU
+    blocks = max(blocks, prop.multiProcessorCount * 2);
+    
+    // Launch main kernel
+    relu_kernel_vec4<<<blocks, threads>>>(in_ptr, out_ptr, N);
+    
+    // Handle tail elements
+    const int processed = (total_vec4s / vec4s_per_thread) * vec4s_per_thread * 4;
+    if (processed < N) {
+        int tail_threads = 256;
+        int tail_blocks = ((N - processed) + tail_threads - 1) / tail_threads;
+        relu_kernel_tail<<<tail_blocks, tail_threads>>>(
+            in_ptr, out_ptr, processed, N
         );
-        return output;
     }
+    
+    // Remove sync for better pipeline
+    return output;
 }
